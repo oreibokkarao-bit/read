@@ -1,0 +1,1213 @@
+{
+  "meta": {
+    "name": "coinalyze_playbook_rules_and_filter_knowledgebase",
+    "version": "2026-01-20",
+    "timezone": "Asia/Kolkata",
+    "goal": "Teach any AI model the exact Coinalyze expression rules plus the meaning, thresholds, and purpose of the user's active filter stack (pump-catch, anti-fakeout, dump detection, squeeze readiness).",
+    "coinalyze_context": {
+      "platform_constraints": {
+        "expression_char_limit_approx": 300,
+        "data_window_limits": {
+          "5m_max_bars": 300,
+          "1h_max_bars": 90,
+          "1d_max_bars": 90
+        },
+        "intraday_retention_warning": "Intraday (1m–12h) data is rolling and older points can be deleted; daily is retained longer. Prefer shallow lookbacks and avoid overfitting."
+      }
+    }
+  },
+  "coinalyze_playbook_rules": {
+    "syntax_ground_rules": {
+      "indexing": {
+        "meaning": {
+          "[0]": "current bar value (platform-dependent: often current/most-recent)",
+          "[-1]": "previous bar value"
+        },
+        "range_slices_allowed": [
+          "series[0,-N] (last N completed bars)",
+          "series[-1:-N] (backward slice starting at -1, going back N bars)"
+        ],
+        "range_slices_forbidden_examples": [
+          "series[-N:-1]",
+          "series[0:-N]",
+          "series[-3:0]"
+        ],
+        "note": "When using SUM/AVG over multiple bars, always use a valid multi-bar slice. Single-bar should be x[0] not SUM(x[0])."
+      },
+      "change_functions": {
+        "CHANGE(series[i0,i1])": "absolute delta between two indexed points",
+        "PCHANGE(series[i0,i1])": "percent change between two indexed points",
+        "rule": "Use CHANGE/PCHANGE with comma-index pairs, not colon ranges."
+      },
+      "allowed_functions_only": [
+        "SMA",
+        "EMA",
+        "AVG",
+        "SUM",
+        "MIN",
+        "MAX",
+        "ROC",
+        "RSI",
+        "CVD",
+        "CVDSPOT",
+        "CHANGE",
+        "PCHANGE"
+      ],
+      "forbidden_constructs": [
+        "ABS",
+        "IF",
+        "AND",
+        "OR",
+        "SIGN",
+        "exponentiation (e.g., ^, **, sqrt via powers)"
+      ],
+      "string_literals": {
+        "rule": "Use lower-case quotes for timeframes, e.g. '1h', '5m'."
+      }
+    },
+    "denominator_and_normalization_rules": {
+      "guard_rule": "Every division must guard the denominator.",
+      "preferred_guard": "+ 0.001",
+      "acceptable_guards": [
+        "+ 0.001",
+        "+ 1 (less preferred)"
+      ],
+      "forbidden_guards": [
+        "1e-9 style micro-guards (e.g., 0.0000001)"
+      ],
+      "avg_sma_guard_pattern": {
+        "preferred": "AVG(series[0,-N]) + 0.001",
+        "allowed": "SMA(series,N)[0] + 0.001",
+        "avoid": "MAX(SMA(...),1) or MAX(AVG(...),1) because it can cause n/a on Coinalyze"
+      },
+      "normalization_principle": "Normalize directional flow (CVD/CVDSPOT) by futures volume (vol_5m or vol_1h) to make thresholds stable across coins."
+    },
+    "data_series_rules": {
+      "volume_series": {
+        "use_for_normalization": [
+          "vol_5m",
+          "vol_1h"
+        ],
+        "avoid_unreliable": [
+          "volspot_* (often returns n/a)"
+        ]
+      },
+      "spot_vs_perp_flow": {
+        "preference": "Spot-led confirmation is higher-confidence than perp-only pumps.",
+        "spot_proxy": "CVDSPOT(...) thrust / slope",
+        "perp_proxy": "CVD(...) thrust / slope"
+      }
+    },
+    "abs_replacement_rules": {
+      "abs_proxy": "Use (x*x) as ABS(x) proxy.",
+      "percent_magnitude_proxy": "Use (x*x)/100 when x is a percent and you want magnitude scaling.",
+      "directionless_penalty": "Use squaring to penalize chasing without needing SIGN/IF."
+    },
+    "timeframe_usage_guidance": {
+      "rule_of_thumb": "Use 1h for watchlist qualification; use 5m for triggers.",
+      "avoid_cross_tf_na": "Avoid mixing stale 1h context with very fresh 5m triggers unless carefully normalized."
+    }
+  },
+  "global_threshold_crib": {
+    "volatility_expansion_5m_bb_proxy": {
+      "entry_gate_range_percent": [
+        0.6,
+        1.1
+      ],
+      "note": "Higher values imply release from compression. Use as a gate, not a standalone entry."
+    },
+    "spot_cvd_kick": {
+      "preferred": "> 0 (positive thrust)",
+      "note": "Spot aggression supports real demand."
+    },
+    "oi_multitf_score": {
+      "build": "> 0.6",
+      "unwind": "< -0.6"
+    },
+    "taker_sell_dominance_1h_safety": {
+      "skip_if": "> 0.55",
+      "meaning": "Sell-side taker dominance raises dump risk; avoid longs."
+    },
+    "spot_led_commitment_score": {
+      "healthy": "> 2",
+      "meaning": "Spot CVD rising faster than price suggests real accumulation."
+    }
+  },
+  "filters": [
+    {
+      "id": "A1",
+      "name": "1h Stealth Accumulation (MANDATORY)",
+      "category": "watchlist_core",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 3
+      },
+      "formula": "PCHANGE(oi_1h[0,-1]) - ((PCHANGE(price_1h[0,-1])*PCHANGE(price_1h[0,-1]))/100*5)",
+      "purpose": "Detect OI build while price stays relatively flat (accumulation without chasing).",
+      "interpretation": {
+        "high_values_mean": "OI rising faster than price, suggesting stealth positioning.",
+        "low_values_mean": "OI not building or price is already moving (chase risk)."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "A2",
+      "name": "Spot-Led Commitment (filters fake perp pumps)",
+      "category": "watchlist_core",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 2
+      },
+      "formula": "PCHANGE(CVDSPOT('1h',20,true)[0,-1]) - PCHANGE(price_1h[0,-1])",
+      "purpose": "Confirm that spot demand leads price (reduces perp-only spoof pumps).",
+      "interpretation": {
+        "high_values_mean": "Spot CVD is outrunning price, indicating genuine buying pressure.",
+        "low_values_mean": "Price is moving without spot support, higher fakeout risk."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "A3",
+      "name": "HTF Base Condition (anti-chase rule)",
+      "category": "risk_gate",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": "<",
+        "value": 6
+      },
+      "formula": "PCHANGE(price_1h[0,-4])",
+      "purpose": "Avoid entering after an extended move (anti-FOMO chase gate).",
+      "interpretation": {
+        "pass_condition": "If last ~4h price change < +6%, you are not late.",
+        "fail_condition": "If >= +6%, likely chasing; expect worse R:R."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "A4",
+      "name": "Coil / Compression (range small)",
+      "category": "structure_gate",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": "<",
+        "value": 5
+      },
+      "formula": "(MAX(price_1h[0,-24]) - MIN(price_1h[0,-24])) / (AVG(price_1h[0,-24]) + 0.001) * 100",
+      "purpose": "Detect tight consolidation (stored energy).",
+      "interpretation": {
+        "low_values_mean": "Range is tight, compression present, breakout potential higher.",
+        "high_values_mean": "Too expanded already; breakout edge weaker."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "BSV",
+      "name": "BuySellVolume value",
+      "category": "trigger_flow",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": ">",
+        "value": 0.2
+      },
+      "formula": "(SUM(volbuy_5m[0,-9]) - SUM(volsell_5m[0,-9])) / (AVG(vol_5m[0,-9]) + 0.001)",
+      "purpose": "Measure net aggressive buy imbalance normalized by total volume (short-term demand impulse).",
+      "interpretation": {
+        "high_values_mean": "Buyers are dominating taker flow.",
+        "low_values_mean": "No real push or sellers dominating."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "CT3",
+      "name": "Core Trio 3 (OI impulse)",
+      "category": "core_trio",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 10
+      },
+      "formula": "PCHANGE( oi_1h[0,-12] )",
+      "purpose": "Quantify OI expansion over ~12h as positioning fuel.",
+      "interpretation": {
+        "high_values_mean": "Fresh leverage/positioning entering.",
+        "low_values_mean": "No fuel, lower pump probability."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "CT1",
+      "name": "Core Trio 1 (Spot accumulation impulse)",
+      "category": "core_trio",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 15
+      },
+      "formula": "PCHANGE( CVDSPOT('1h', 20, true)[0,-12] )",
+      "purpose": "Spot CVD expansion over ~12h, a high-confidence demand signal.",
+      "interpretation": {
+        "high_values_mean": "Spot buyers consistently accumulating.",
+        "low_values_mean": "No sustained spot demand."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "CT2",
+      "name": "Core Trio 2 (Futures CVD reset / absorption)",
+      "category": "core_trio",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": "<",
+        "value": -15
+      },
+      "formula": "PCHANGE( CVD('1h', 20, true)[0,-12] )",
+      "purpose": "Detect heavy futures-side selling while spot still builds (often sets up squeezes or reversals).",
+      "interpretation": {
+        "very_negative_mean": "Strong perp selling / hedging pressure present.",
+        "context_note": "Best when paired with strong spot-led metrics (to avoid pure dump regimes)."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "CVD_DIV",
+      "name": "CVD Divergence (Spot vs Futures)",
+      "category": "flow_divergence",
+      "timeframe": "5m",
+      "threshold": {
+        "notes": "User rule: Dump if <= -0.1, Pump if > 0.1"
+      },
+      "formula": "((CVDSPOT('5m',20,true)[0]-CVDSPOT('5m',20,true)[-5])/(AVG(volspot_5m[-1:-5])+1)) -((CVD('5m',20,true)[0]-CVD('5m',20,true)[-5])/(AVG(vol_5m[-1:-5])+1))",
+      "purpose": "Compare spot thrust vs futures thrust to detect spot-led health or perp-led fragility.",
+      "interpretation": {
+        "positive_mean": "Spot thrust exceeds perp thrust (healthier pump).",
+        "negative_mean": "Perp pressure dominates or spot absent (dump risk / fake pump)."
+      },
+      "compliance": {
+        "status": "needs_fix",
+        "violations": [
+          "uses volspot_* (often n/a)"
+        ],
+        "recommended_fix_formula": "((CVDSPOT('5m',20,true)[0]-CVDSPOT('5m',20,true)[-5])/(AVG(vol_5m[0,-6])+0.001)) -((CVD('5m',20,true)[0]-CVD('5m',20,true)[-5])/(AVG(vol_5m[0,-6])+0.001))"
+      }
+    },
+    {
+      "id": "D2_OI",
+      "name": "D2 Cascade dump OI (liq-long relative to OI)",
+      "category": "dump_detection",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 0.5
+      },
+      "formula": "(SUM(liqlong_1h[0,-3]) / (AVG(oi_1h[0,-3]) + 0.001)) * 100",
+      "purpose": "Detect liquidations intensity versus OI base (cascade risk).",
+      "interpretation": {
+        "high_values_mean": "Long liquidations are large relative to OI, cascade likely.",
+        "low_values_mean": "Liquidations not structurally threatening."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "D2_IGN",
+      "name": "D2 Cascade ignition (liq-long relative to volume)",
+      "category": "dump_detection",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 0.1
+      },
+      "formula": "(SUM(liqlong_1h[0:-3]) / SUM(vol_1h[0:-3])) * 100",
+      "purpose": "Detect liquidation ignition vs traded volume (stress burst).",
+      "interpretation": {
+        "high_values_mean": "A lot of trading is forced (liquidation-driven).",
+        "low_values_mean": "Flow is mostly organic."
+      },
+      "compliance": {
+        "status": "needs_fix",
+        "violations": [
+          "invalid slice format [0:-3]"
+        ],
+        "recommended_fix_formula": "(SUM(liqlong_1h[0,-3]) / (SUM(vol_1h[0,-3]) + 0.001)) * 100"
+      }
+    },
+    {
+      "id": "D4_CVD",
+      "name": "D4 CVD strong selling (per-volume)",
+      "category": "dump_detection",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": "<",
+        "value": -0.25
+      },
+      "formula": "(CVD('5m',20,true)[0] - CVD('5m',20,true)[-3]) / (AVG(vol_5m[0,-18]) + 0.001) * 100",
+      "purpose": "Detect heavy futures-side selling pressure normalized by volume.",
+      "interpretation": {
+        "very_negative_mean": "Strong selling impulse; avoid longs or consider short setups."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "DUMP_C",
+      "name": "Dump C Long Liquidation Cascade",
+      "category": "dump_detection",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": ">",
+        "value": 3.0
+      },
+      "formula": "SUM(liqlong_5m[0,-2])/(AVG(liqlong_5m[-3:-24])+1)",
+      "purpose": "Detect sudden long liquidation spike versus recent baseline (cascade amplifier).",
+      "interpretation": {
+        "high_values_mean": "Current liq-long burst is multiples of baseline, cascade ongoing."
+      },
+      "compliance": {
+        "status": "needs_fix",
+        "violations": [
+          "backward slice does not start at -1 (uses [-3:-24])",
+          "uses +1 guard (allowed but not preferred)"
+        ],
+        "recommended_fix_formula": "SUM(liqlong_5m[0,-2])/(AVG(liqlong_5m[0,-24])+0.001)"
+      }
+    },
+    {
+      "id": "DUMP_E",
+      "name": "Dump E Aggregated CVD Momentum",
+      "category": "dump_detection",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": "<",
+        "value": -15
+      },
+      "formula": "PCHANGE(CVD('5m',20,true)[0,-3])+PCHANGE(CVDSPOT('5m',20,true)[0,-3])",
+      "purpose": "Aggregate futures+spot CVD momentum for dump confirmation.",
+      "interpretation": {
+        "very_negative_mean": "Broad selling pressure across venues."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "BREAKOUT_X",
+      "name": "Explosive Breakout from Long Consolidation",
+      "category": "breakout_gate",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 0.5
+      },
+      "formula": "(PCHANGE(oi_1h[0,-3]) + PCHANGE(CVDSPOT('1h',20,true)[0,-3])) / ((MAX(price_1h[-1:-4]) - MIN(price_1h[-1:-4])) / (SMA(price_1h,4)[0] + 0.001) * 10)",
+      "purpose": "Score breakout likelihood by combining fuel (OI) + spot demand, divided by recent range (compression).",
+      "interpretation": {
+        "high_values_mean": "Fuel + demand are large relative to range, breakout probability higher.",
+        "low_values_mean": "Not enough force vs structure."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "FRESH_OI",
+      "name": "Fresh OI build (crowding fuel)",
+      "category": "fuel",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 6
+      },
+      "formula": "PCHANGE(oi_1h[0,-6])",
+      "purpose": "Detect recent OI build to power squeezes/pumps.",
+      "interpretation": {
+        "high_values_mean": "Crowding/fuel building."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "FR_FLIP_1H",
+      "name": "FR flip down (fast funding shift)",
+      "category": "funding",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": "<",
+        "value": -0.02
+      },
+      "formula": "CHANGE(fr_1h[0,-1])*100",
+      "purpose": "Detect fast funding deterioration (can precede dumps or set up squeezes if flow turns).",
+      "interpretation": {
+        "more_negative_mean": "Funding moved down sharply; crowd positioning shifting."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "FUT_CVD_NORM_1H",
+      "name": "Futures CVD normalized 1h",
+      "category": "flow",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": "<",
+        "value": -0.25
+      },
+      "formula": "CHANGE(CVD('1h',20,true)[0,-1])/(AVG(vol_1h[0,-6])+0.001)*100",
+      "purpose": "Per-volume futures selling/buying impulse on 1h.",
+      "interpretation": {
+        "very_negative_mean": "Meaningful sell impulse; increases dump risk."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "L1_VOL_ANOM",
+      "name": "L1 Futures volume anomaly",
+      "category": "trigger_liquidity",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": ">",
+        "value": 1.8
+      },
+      "formula": "vol_5m[0] / (AVG(vol_5m[0,-6]) + 0.001)",
+      "purpose": "Detect sudden liquidity arrival / attention shock.",
+      "interpretation": {
+        "high_values_mean": "Volume jumped relative to baseline, conditions ripe for continuation."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "L1_OI_BUILD",
+      "name": "L1 OI build (fast)",
+      "category": "trigger_fuel",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": ">",
+        "value": 8
+      },
+      "formula": "PCHANGE(oi_5m[0,-6])",
+      "purpose": "Detect rapid OI expansion at LTF (fuel ignition).",
+      "interpretation": {
+        "high_values_mean": "Crowding/fuel arrives quickly, can accelerate moves."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "L2_FORCED_FLOW_30M",
+      "name": "L2 Forced Flow 30m",
+      "category": "trigger_flow",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": ">",
+        "value": 0.3
+      },
+      "formula": "(SUM(volbuy_5m[0,-6]) - SUM(volsell_5m[0,-6])) / (AVG(vol_5m[0,-12]) + 0.001)",
+      "purpose": "Capture sustained buy dominance across ~30m window (forced flow incoming).",
+      "interpretation": {
+        "high_values_mean": "Buy flow persists, trend initiation more likely."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "L3_BB_EXP",
+      "name": "L3 BB Expansion (Volatility release gate)",
+      "category": "trigger_volatility",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": "range",
+        "min": 0.6,
+        "max": 1.1
+      },
+      "formula": "( MAX(price_5m[-1:-3]) - MIN(price_5m[-1:-3]) ) / ( SMA(price_5m,20)[0] + 0.001 ) * 100",
+      "purpose": "Detect volatility release from compression using a BB-like proxy.",
+      "interpretation": {
+        "in_range_mean": "Clean release window, often best early R:R.",
+        "too_high_mean": "Already expanded, chase risk rises."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "L3_FORCED_BURST_5M",
+      "name": "L3 Forced Burst (buy-sell per baseline)",
+      "category": "trigger_flow",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": "range",
+        "min": 0.1,
+        "max": 0.25
+      },
+      "formula": "(volbuy_5m[0] - volsell_5m[0]) / (AVG(vol_5m[0,-12]) + 0.001)",
+      "purpose": "Spot early burst candle where net taker buy is significant vs baseline.",
+      "interpretation": {
+        "in_range_mean": "Burst starting without being too late."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "L3_SPOT_CVD_THRUST",
+      "name": "L3 Spot CVD Thrust (Spot aggression)",
+      "category": "trigger_flow",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": ">",
+        "value": 1.5
+      },
+      "formula": "CHANGE(CVDSPOT('5m',40,true)[0,-1]) / (AVG(vol_5m[0,-6]) + 0.001)",
+      "purpose": "Spot aggression normalized by futures volume (stable across coins).",
+      "interpretation": {
+        "high_values_mean": "Real demand shock, strongest pump confirmation."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "L3_VOL_THRUST",
+      "name": "L3 Volume Thrust (Volume ignition)",
+      "category": "trigger_liquidity",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": ">",
+        "value": 2.5
+      },
+      "formula": "SUM(vol_5m[0,-3]) / (AVG(vol_5m[0,-12]) + 0.001)",
+      "purpose": "Confirm multi-candle volume ignition.",
+      "interpretation": {
+        "high_values_mean": "Volume persistence supports continuation."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "LTF_MOMO_IGN",
+      "name": "LTF Momentum Ignition (5m)",
+      "category": "trigger_momentum",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": ">",
+        "value": 10
+      },
+      "formula": "( PCHANGE(price_5m[0,-3]) * ( SUM(vol_5m[0,-3]) / (AVG(vol_5m[0,-12]) + 0.001) ) )",
+      "purpose": "Blend price velocity with volume persistence to capture early acceleration.",
+      "interpretation": {
+        "high_values_mean": "Acceleration signature present."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "NIHILUS_1",
+      "name": "Nihilus Spot Ignition",
+      "category": "nihilus_stack",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": ">",
+        "value": 1.2
+      },
+      "formula": "(CHANGE(CVDSPOT('5m',40,true)[0,-1])/(AVG(vol_5m[0,-6])+0.001)) + ROC(price_5m,3)[0]",
+      "purpose": "Combine spot thrust + short ROC for early ignition detection.",
+      "interpretation": {
+        "high_values_mean": "Demand shock plus price response, good early entry zone."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "NIHILUS_2",
+      "name": "Nihilus OI Fuel Meter",
+      "category": "nihilus_stack",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": ">=",
+        "value": 2.2,
+        "bands": {
+          "explosion": ">= 2.2",
+          "trend": "1.4 to 2.1",
+          "skip": "< 1.4"
+        }
+      },
+      "formula": "(PCHANGE(oi_5m[0,-5])*1.5) + PCHANGE(CVDSPOT('5m',20,true)[0,-1]) - (fr_5m[0]*500)",
+      "purpose": "Fuel score mixing OI build, spot demand, and funding penalty.",
+      "interpretation": {
+        "very_high_mean": "Fuel + demand aligned, strongest continuation odds.",
+        "low_mean": "Not enough fuel or funding not supportive."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "NIHILUS_3",
+      "name": "Nihilus Spot-Led Commitment Score",
+      "category": "nihilus_stack",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 2
+      },
+      "formula": "(PCHANGE(CVDSPOT('1h',20,true)[0,-1]) - PCHANGE(price_1h[0,-1])) * (SMA(volspot_1h,3)[0] / (AVG(vol_1h[-1:-10])+1))",
+      "purpose": "Scale spot-led commitment by activity regime (volume factor).",
+      "interpretation": {
+        "high_values_mean": "Spot leads price and participation is sufficient."
+      },
+      "compliance": {
+        "status": "needs_fix",
+        "violations": [
+          "uses volspot_* (often n/a)",
+          "uses +1 guard (allowed but not preferred)"
+        ],
+        "recommended_fix_formula": "(PCHANGE(CVDSPOT('1h',20,true)[0,-1]) - PCHANGE(price_1h[0,-1])) * (SMA(vol_1h,3)[0] / (AVG(vol_1h[0,-10])+0.001))"
+      }
+    },
+    {
+      "id": "OI_MULTI_TF",
+      "name": "OI Multi-TF Score",
+      "category": "fuel",
+      "timeframe": "mixed",
+      "threshold": {
+        "operator": "reference",
+        "notes": "Build > 0.6, Unwind < -0.6 (global crib)"
+      },
+      "formula": "(PCHANGE(oi_5m[0,-5]) + PCHANGE(oi_1h[0,-1]) + PCHANGE(oi_1h[0,-3])) / 3",
+      "purpose": "Robust fuel gauge using multiple windows to reduce noise.",
+      "interpretation": {
+        "high_positive_mean": "Positioning building (fuel).",
+        "high_negative_mean": "Unwind (risk / dump)."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "OI_DOLLAR_PULSE",
+      "name": "OI-Dollar Pulse (normalize by notional)",
+      "category": "fuel",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": "contextual",
+        "notes": "+ve implies pump alignment; -ve implies unwind"
+      },
+      "formula": "((oi_5m[0]*price_5m[0]-oi_5m[-3]*price_5m[-3]) / ((oi_5m[-3]*price_5m[-3])+0.001)) * 100",
+      "purpose": "Measure change in OI notional, capturing real size changes (not just %).",
+      "interpretation": {
+        "positive_mean": "Notional exposure is rising (fuel).",
+        "negative_mean": "Notional exposure shrinking (unwind)."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "P1",
+      "name": "P1 Price Velocity 1H",
+      "category": "pump_score_component",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 10
+      },
+      "formula": "PCHANGE(price_1h[0, -3])",
+      "purpose": "Detect sustained price acceleration (momentum leg).",
+      "interpretation": {
+        "high_values_mean": "Strong momentum present."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "P2A",
+      "name": "P2 OI+Price Convergence 1H",
+      "category": "pump_score_component",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 15
+      },
+      "formula": "PCHANGE(oi_1h[0, -3]) + PCHANGE(price_1h[0, -3])",
+      "purpose": "Detect when fuel and price move together (healthy trend phase).",
+      "interpretation": {
+        "high_values_mean": "Fuel + trend aligned."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "P2B",
+      "name": "P2 Volume Spike 1H",
+      "category": "pump_score_component",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 5
+      },
+      "formula": "(vol_1h[0] / (AVG(vol_1h[-1:-24]) + 1))",
+      "purpose": "Confirm participation expansion (attention + liquidity).",
+      "interpretation": {
+        "high_values_mean": "Unusual activity supports continuation."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [
+          "uses +1 guard (allowed but not preferred)"
+        ],
+        "recommended_fix_formula": "vol_1h[0] / (AVG(vol_1h[0,-24]) + 0.001)"
+      }
+    },
+    {
+      "id": "P4A",
+      "name": "P4 Liq-to-OI Ratio 1H",
+      "category": "pump_score_component",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 0.1
+      },
+      "formula": "(SUM(liq_1h[0:-3]) / (AVG(oi_1h[0:-3]) + 1))",
+      "purpose": "Stress gauge: liquidations relative to OI base.",
+      "interpretation": {
+        "high_values_mean": "Forced activity is meaningful vs positioning base."
+      },
+      "compliance": {
+        "status": "needs_fix",
+        "violations": [
+          "invalid slice format [0:-3]",
+          "uses +1 guard (allowed but not preferred)"
+        ],
+        "recommended_fix_formula": "(SUM(liq_1h[0,-3]) / (AVG(oi_1h[0,-3]) + 0.001))"
+      }
+    },
+    {
+      "id": "P4B",
+      "name": "P4 Negative Funding Depth",
+      "category": "squeeze_component",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": "<",
+        "value": -0.5
+      },
+      "formula": "fr_1h[0]",
+      "purpose": "When funding is deep negative, shorts may be crowded (squeeze setup if flow flips).",
+      "interpretation": {
+        "very_negative_mean": "Crowded shorts possible."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "P4C",
+      "name": "P4 Short Liq Spike 5M",
+      "category": "squeeze_component",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": ">",
+        "value": 10
+      },
+      "formula": "(liqshort_5m[0] / (AVG(liqshort_5m[-1:-12]) + 0.0000001))",
+      "purpose": "Detect squeeze pop when shorts start liquidating (ignition).",
+      "interpretation": {
+        "high_values_mean": "Short liquidations spiking, squeeze underway."
+      },
+      "compliance": {
+        "status": "needs_fix",
+        "violations": [
+          "forbidden micro-guard (0.0000001)",
+          "prefer [0,-N] slice for AVG baseline"
+        ],
+        "recommended_fix_formula": "liqshort_5m[0] / (AVG(liqshort_5m[0,-12]) + 0.001)"
+      }
+    },
+    {
+      "id": "SQ_B1A",
+      "name": "Short Squeeze B1 Liquidation Ignition",
+      "category": "short_squeeze",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": ">",
+        "value": 0.03
+      },
+      "formula": "SUM(liqshort_5m[0,-3])/(oi_5m[0]+0.001)*100",
+      "purpose": "Normalize short liquidation burst by current OI (squeeze intensity).",
+      "interpretation": {
+        "high_values_mean": "Meaningful shorts forced out relative to positioning."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "SQ_B1B",
+      "name": "Short Squeeze B1 Volume Punch",
+      "category": "short_squeeze",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": ">",
+        "value": 2
+      },
+      "formula": "vol_5m[0]/(AVG(vol_5m[0,-20])+0.001)",
+      "purpose": "Confirm squeeze has liquidity and attention.",
+      "interpretation": {
+        "high_values_mean": "Real participation behind the move."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "SQ_FRESH_OI",
+      "name": "Short Squeeze Fresh OI (price-flat build)",
+      "category": "short_squeeze",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 4
+      },
+      "formula": "PCHANGE(oi_1h[0,-1]) - ((PCHANGE(price_1h[0,-1])*PCHANGE(price_1h[0,-1]))/100*3)",
+      "purpose": "Squeeze fuel: shorts crowded while price not yet running (best R:R).",
+      "interpretation": {
+        "high_values_mean": "Fuel is building pre-move."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "SQ_FUNDING",
+      "name": "Short Squeeze Funding (sustained negative)",
+      "category": "short_squeeze",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": "<",
+        "value": -0.02
+      },
+      "formula": "AVG(fr_1h[0,-6])",
+      "purpose": "Confirm negative funding regime (short crowding).",
+      "interpretation": {
+        "more_negative_mean": "Short crowding more likely."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "SQ_LSR",
+      "name": "Short Squeeze LSR (long/short ratio)",
+      "category": "short_squeeze",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": "<",
+        "value": 0.85
+      },
+      "formula": "lsr_1h[0]",
+      "purpose": "If LSR is low, market is short-heavy (squeeze susceptible).",
+      "interpretation": {
+        "lower_mean": "More shorts relative to longs."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "SQ_NOCHASE",
+      "name": "Short Squeeze No-Chase Gate",
+      "category": "risk_gate",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": "<",
+        "value": 6
+      },
+      "formula": "PCHANGE(price_1h[0,-4])",
+      "purpose": "Avoid late squeeze entries after the move already started.",
+      "interpretation": {
+        "pass_mean": "Still early."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "SQ_VOL",
+      "name": "Short Squeeze Volume 1H",
+      "category": "short_squeeze",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 1.5
+      },
+      "formula": "vol_1h[0]/(AVG(vol_1h[0,-20])+0.001)",
+      "purpose": "Confirm squeeze has participation.",
+      "interpretation": {
+        "high_values_mean": "Good liquidity and continuation odds."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "SPOT_FMI",
+      "name": "Spot Fresh Money Index",
+      "category": "trigger_flow",
+      "timeframe": "5m",
+      "threshold": {
+        "operator": ">",
+        "value": 1.2
+      },
+      "formula": "(CHANGE(CVDSPOT('5m',40,true)[0,-1])/(AVG(vol_5m[0,-6])+0.001))*10 +(SUM(vol_5m[0,-3])/(AVG(vol_5m[0,-12])+0.001))*0.2",
+      "purpose": "Composite: spot thrust (heavy weight) + volume persistence (light weight).",
+      "interpretation": {
+        "high_values_mean": "Fresh capital entering spot, strong early pump confirmation."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "SPOT_LED_DIV_1H",
+      "name": "Spot-Led CVD Divergence Lead (1h)",
+      "category": "watchlist_core",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 2
+      },
+      "formula": "PCHANGE(CVDSPOT('1h',20,true)[0,-1]) - PCHANGE(price_1h[0,-1])",
+      "purpose": "Spot leads price, filters perp-only fake moves.",
+      "interpretation": {
+        "high_values_mean": "Genuine demand under the surface."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "SPOT_CVD_NORM_1H",
+      "name": "Spot CVD normalized 1H (safety floor)",
+      "category": "risk_gate",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": -0.05
+      },
+      "formula": "CHANGE(CVDSPOT('1h',20,true)[0,-1])/(AVG(vol_1h[0,-6])+0.001)*100",
+      "purpose": "Ensure spot pressure is not meaningfully negative (avoid long entries into spot selling).",
+      "interpretation": {
+        "below_threshold_mean": "Spot selling, long setups weaker or invalid."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "STEALTH_OI_ACCUM_BAD",
+      "name": "Stealth OI Accumulation (price-flat build) (original provided)",
+      "category": "fuel",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 4
+      },
+      "formula": "PCHANGE(oi_1h[0,-1]) - 3*((PCHANGE(price_1h[0,-1])^2)^0.5)",
+      "purpose": "Intended: penalize price movement while tracking OI build.",
+      "interpretation": {
+        "note": "This version is not Coinalyze-safe due to exponentiation."
+      },
+      "compliance": {
+        "status": "needs_fix",
+        "violations": [
+          "exponentiation is forbidden (^2, ^0.5)"
+        ],
+        "recommended_fix_formula": "PCHANGE(oi_1h[0,-1]) - ((PCHANGE(price_1h[0,-1])*PCHANGE(price_1h[0,-1]))/100*3)"
+      }
+    },
+    {
+      "id": "SELL_DOM_1H",
+      "name": "Taker Sell Dominance (1h) SAFETY",
+      "category": "risk_gate",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 0.55,
+        "action": "skip_longs"
+      },
+      "formula": "SUM(volsell_1h[0,-6])/(SUM(vol_1h[0,-6])+0.001)",
+      "purpose": "Fail-safe: if sellers dominate taker flow, dump risk is high.",
+      "interpretation": {
+        "above_threshold_mean": "Avoid longs; conditions are hostile."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    },
+    {
+      "id": "VACUUM_1H",
+      "name": "Vacuum 1h (air pocket cleanliness)",
+      "category": "structure_gate",
+      "timeframe": "1h",
+      "threshold": {
+        "operator": ">",
+        "value": 1.6
+      },
+      "formula": "(AVG(oi_1h[0,-6])/(AVG(vol_1h[0,-6])+0.001))/(((MAX(highprice_1h[-1:-6])-MIN(lowprice_1h[-1:-6]))/(SMA(price_1h,20)[0]+0.001))*100+0.01)",
+      "purpose": "Detect thin liquidity + elevated positioning relative to range (clean air pocket moves).",
+      "interpretation": {
+        "high_values_mean": "Cleaner directional move potential (less chop).",
+        "low_values_mean": "Messy liquidity or too wide range."
+      },
+      "compliance": {
+        "status": "ok",
+        "violations": [],
+        "recommended_fix_formula": null
+      }
+    }
+  ],
+  "execution_guidance": {
+    "recommended_pipeline": [
+      {
+        "step": 1,
+        "name": "Watchlist Qualification (1h)",
+        "logic": "Require A1 + A2 pass, enforce A3 no-chase and A4 compression.",
+        "goal": "Only track coins with stealth fuel + spot-led confirmation + not extended + compressed structure."
+      },
+      {
+        "step": 2,
+        "name": "LTF Trigger (5m)",
+        "logic": "Require L1 volume anomaly + L3 BB expansion in range + L3 spot thrust + L3 volume thrust. Optionally add LTF momentum ignition.",
+        "goal": "Enter only when the move is actually igniting, not during dead chop."
+      },
+      {
+        "step": 3,
+        "name": "Safety Gates",
+        "logic": "Skip longs if Sell Dominance 1h > 0.55 or if SPOT_CVD_NORM_1H is too negative.",
+        "goal": "Avoid ‘beautiful-looking’ setups that are actually dump regimes."
+      },
+      {
+        "step": 4,
+        "name": "Squeeze Branch",
+        "logic": "If funding is negative + LSR low + fresh OI build while no-chase passes, watch for short-liq ignition + volume punch.",
+        "goal": "Catch forced liquidation legs with high convexity."
+      }
+    ],
+    "compliance_policy": {
+      "rule": "If any filter is 'needs_fix', use its recommended_fix_formula for production. Never ship forbidden constructs (volspot_*, exponentiation, invalid slices, micro-guards)."
+    }
+  }
+}
